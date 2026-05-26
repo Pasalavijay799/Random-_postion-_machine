@@ -45,18 +45,10 @@ MAX_RPM        = 120
 
 FILTER_ALPHA = 0.3
 
-# ── FIX 1: Ramp is now RPM-per-SECOND (not per tick) ─────────────────────────
-# step_thread runs every ~half_period which varies with RPM.
-# We instead track wall-clock time so ramp is always e.g. 3 RPM/sec.
-RAMP_UP_RPS   = 3.0   # RPM per second to ramp up   (reach 3 RPM in ~1 sec)
-RAMP_DOWN_RPS = 5.0   # RPM per second to ramp down  (reach 0 from 10 in ~2 sec)
-
-# ── FIX 2: Deadband tightened — ±0.8 was too loose at 3–10 RPM range ─────────
-DEADBAND_RPM  = 0.3   # was 0.8 — at 3 RPM, ±0.3 is 10% tolerance (acceptable)
+RAMP_UP      = 1.0
+RAMP_DOWN    = 1.5
+DEADBAND_RPM = 0.8
 DEADBAND_HOLD = 3
-
-# ── FIX 5: Direction change ramp-to-zero time ─────────────────────────────────
-DIR_CHANGE_RAMP_SECS = 0.4   # ramp down fully before flipping direction
 
 ZN_GAINS = {
     "classic":      {"Kp": 0.240, "Ki": 2.400, "Kd": 0.006},
@@ -99,9 +91,6 @@ _run_mode_for_graph = "manual"
 h = None
 log_queue = queue.Queue()
 
-# ── FIX 1: ramp timing state shared between step_thread and ramp logic ────────
-_last_step_time = 0.0   # wall clock of last step_thread iteration
-
 
 def qprint(*args, **kwargs):
     buf = io.StringIO()
@@ -141,7 +130,6 @@ def pid_thread():
 
     last_print = time.time()
     last_flush = time.time()
-    _prev_target = target_rpm   # FIX 4: track target changes
 
     while running:
         t0 = time.time()
@@ -156,19 +144,9 @@ def pid_thread():
         filtered_rpm = ((1.0 - FILTER_ALPHA) * filtered_rpm
                         + FILTER_ALPHA * actual_rpm)
 
-        # ── FIX 4: Reset integral and error on target change ──────────────────
-        nonlocal_target = target_rpm   # read once
-        if nonlocal_target != _prev_target:
-            integral         = 0.0
-            last_error       = 0.0
-            freq_locked      = False
-            deadband_counter = 0
-            _prev_target     = nonlocal_target
-            qprint(f"[PID] Target changed → {nonlocal_target:.1f} RPM — integral reset")
+        error = target_rpm - filtered_rpm
 
-        error = nonlocal_target - filtered_rpm
-
-        if nonlocal_target == 0:
+        if target_rpm == 0:
             command_rpm      = 0.0
             integral         = 0.0
             filtered_rpm     = 0.0
@@ -201,18 +179,18 @@ def pid_thread():
             last_error = error
 
             pid_out     = (Kp * error) + (Ki * integral) + (Kd * derivative)
-            command_rpm = max(0.0, min(float(MAX_RPM), nonlocal_target + pid_out))
+            command_rpm = max(0.0, min(float(MAX_RPM), target_rpm + pid_out))
 
         t = time.time() - start_time
 
         rpm_log.append(actual_rpm)
         filtered_log.append(filtered_rpm)
-        target_log.append(nonlocal_target)
+        target_log.append(target_rpm)
         time_log.append(t)
 
         if log_file:
             log_file.write(
-                f"{t:.2f},{nonlocal_target:.2f},{actual_rpm:.2f},"
+                f"{t:.2f},{target_rpm:.2f},{actual_rpm:.2f},"
                 f"{filtered_rpm:.2f},{command_rpm:.2f},{count},{int(freq_locked)}\n"
             )
             if time.time() - last_flush >= 5.0:
@@ -222,7 +200,7 @@ def pid_thread():
         if time.time() - last_print >= 0.5:
             state = "LOCKED" if freq_locked else "PID   "
             qprint(
-                f"[{state}] Target:{nonlocal_target:5.1f} "
+                f"[{state}] Target:{target_rpm:5.1f} "
                 f"| Actual:{actual_rpm:5.1f} "
                 f"| Filtered:{filtered_rpm:5.1f} "
                 f"| Cmd:{command_rpm:5.1f} "
@@ -236,20 +214,10 @@ def pid_thread():
 
 
 def step_thread():
-    """
-    FIX 1: Ramp is now time-based (RPM/sec) so it's consistent at ALL RPMs.
-    At 3 RPM, the half_period is long — old tick-based ramp was extremely slow.
-    Now we measure actual elapsed time between iterations to scale ramp correctly.
-    """
     global current_rpm
     step_state = 0
-    _last_time = time.time()
 
     while running:
-        now     = time.time()
-        dt      = now - _last_time          # actual time since last iteration
-        _last_time = now
-
         if not HARDWARE:
             time.sleep(0.01)
             continue
@@ -257,11 +225,10 @@ def step_thread():
         if freq_locked and target_rpm > 0:
             current_rpm = locked_command
         else:
-            # Time-based ramp: scale by dt so it's RPM/sec regardless of loop speed
             if current_rpm < command_rpm:
-                current_rpm = min(current_rpm + RAMP_UP_RPS * dt, command_rpm)
+                current_rpm = min(current_rpm + RAMP_UP, command_rpm)
             elif current_rpm > command_rpm:
-                current_rpm = max(current_rpm - RAMP_DOWN_RPS * dt, command_rpm)
+                current_rpm = max(current_rpm - RAMP_DOWN, command_rpm)
 
         if current_rpm <= 0:
             lgpio.gpio_write(h, ENA_PIN, 1)
@@ -310,45 +277,6 @@ def sweep_thread(sweep_rpms, sweep_dwell):
     stop_run()
 
 
-def _safe_direction_change(new_dir, new_rpm):
-    """
-    FIX 3: Ramp motor to 0 before flipping direction pin, then set new target.
-    This prevents the current spike from instant direction reversal.
-    """
-    global target_rpm, command_rpm, current_rpm, integral
-    global freq_locked, deadband_counter
-
-    qprint(f"[DIR] Ramping to 0 before direction change ({DIR_CHANGE_RAMP_SECS}s)...")
-
-    # Step 1: Command motor to stop
-    target_rpm       = 0.0
-    command_rpm      = 0.0
-    integral         = 0.0
-    freq_locked      = False
-    deadband_counter = 0
-
-    # Step 2: Wait for motor to actually decelerate to near-zero
-    deadline = time.time() + DIR_CHANGE_RAMP_SECS + 0.5
-    while time.time() < deadline and running:
-        if current_rpm < 0.5:
-            break
-        time.sleep(0.05)
-
-    # Step 3: Extra safety pause
-    time.sleep(0.1)
-
-    # Step 4: Flip direction
-    if HARDWARE:
-        lgpio.gpio_write(h, DIR_PIN, new_dir)
-    time.sleep(0.05)   # let direction signal settle
-
-    # Step 5: Set new target — PID integral already reset above
-    target_rpm       = float(new_rpm)
-    freq_locked      = False
-    deadband_counter = 0
-    qprint(f"[DIR] Direction set → {'CW' if new_dir else 'CCW'}, target={new_rpm} RPM")
-
-
 def random_thread(rmin, rmax, tmin, tmax, steps):
     global target_rpm, command_rpm, integral
     global running, freq_locked, deadband_counter
@@ -359,13 +287,9 @@ def random_thread(rmin, rmax, tmin, tmax, steps):
     qprint(f" RPM range : {rmin} – {rmax}")
     qprint(f" Time range: {tmin}s – {tmax}s")
     qprint(f" Steps     : {steps}")
-    qprint(f" Deadband  : ±{DEADBAND_RPM} RPM  (tightened for accuracy)")
-    qprint(f" Dir ramp  : {DIR_CHANGE_RAMP_SECS}s before flip")
     qprint("====================================")
     qprint(" Starting in 3 seconds...")
     time.sleep(3.0)
-
-    last_dir = 1  # track previous direction to detect changes
 
     for idx in range(steps):
         if not running:
@@ -373,29 +297,18 @@ def random_thread(rmin, rmax, tmin, tmax, steps):
 
         rpm       = random.randint(rmin, rmax)
         direction = random.choice([0, 1])
-        dwell     = random.randint(tmin, tmax)
+        if HARDWARE:
+            lgpio.gpio_write(h, DIR_PIN, direction)
         dir_text  = "CW" if direction == 1 else "CCW"
-
+        dwell     = random.randint(tmin, tmax)
+        target_rpm       = float(rpm)
+        freq_locked      = False
+        deadband_counter = 0
         qprint(
             f"\n[RANDOM {idx+1}/{steps}] "
             f"→ {rpm} RPM | DIR={dir_text} | HOLD={dwell}s"
         )
 
-        # ── FIX 3: Safe direction change with ramp-to-zero ────────────────────
-        if direction != last_dir:
-            qprint(f"[RANDOM] Direction change detected — safe ramp required")
-            _safe_direction_change(direction, rpm)
-        else:
-            # Same direction — just update target, PID handles the transition
-            if HARDWARE:
-                lgpio.gpio_write(h, DIR_PIN, direction)
-            target_rpm       = float(rpm)
-            freq_locked      = False
-            deadband_counter = 0
-
-        last_dir = direction
-
-        # Hold at this RPM for dwell seconds
         elapsed = 0.0
         while elapsed < dwell and running:
             time.sleep(0.5)
@@ -579,28 +492,12 @@ class App(tk.Tk):
         self._card_zn(left)
         self._card_mode(left)
         self._card_manual(left)
-        self._card_fix_info(left)   # NEW: shows fix summary
         self._card_actions(left)
 
         right = tk.Frame(body, bg=BG)
         right.grid(row=0, column=1, sticky="nsew")
         body.columnconfigure(1, weight=1)
         self._card_terminal(right)
-
-    def _card_fix_info(self, parent):
-        """NEW: Shows active fix parameters so user knows what changed."""
-        c = self._colors
-        f = self._card(parent, "ACTIVE FIXES")
-        lines = [
-            f"Ramp UP   : {RAMP_UP_RPS} RPM/sec  (time-based)",
-            f"Ramp DOWN : {RAMP_DOWN_RPS} RPM/sec (time-based)",
-            f"Deadband  : ±{DEADBAND_RPM} RPM     (was ±0.8)",
-            f"Dir ramp  : {DIR_CHANGE_RAMP_SECS}s  zero before flip",
-            f"Integral  : reset on target change",
-        ]
-        for line in lines:
-            tk.Label(f, text=line, bg=c["PNL"], fg=c["ACC"],
-                     font=("Courier New", 8)).pack(anchor="w", padx=10, pady=0)
 
     def _card_zn(self, parent):
         c = self._colors
@@ -816,7 +713,7 @@ class App(tk.Tk):
         qprint(f"\n[GUI] Starting — ZN={MODE}  Kp={Kp} Ki={Ki} Kd={Kd}")
         qprint(f"[GUI] Run mode  : {run_mode.upper()}")
         qprint(f"[GUI] Deadband  : ±{DEADBAND_RPM} RPM")
-        qprint(f"[GUI] Ramp      : up={RAMP_UP_RPS} RPM/s  dn={RAMP_DOWN_RPS} RPM/s")
+        qprint(f"[GUI] Ramp      : up={RAMP_UP}  dn={RAMP_DOWN} (per tick)")
         qprint(f"[GUI] Log file  : {log_filename}\n")
 
         t1 = threading.Thread(target=encoder_thread, daemon=True)
